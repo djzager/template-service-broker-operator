@@ -1,0 +1,257 @@
+---
+- name: template-service-broker-operator test
+  hosts: localhost
+  become: false
+  gather_facts: false
+  connection: local
+  vars:
+    tests_deploy_broker: true
+    broker_name: template-service-broker
+    broker_namespace: openshift-template-service-broker
+    test_namespace: tsb-test
+
+    ready_status_query: "status.conditions[?type == 'Ready'].status"
+    service_broker_query_namespace: "{{ None if broker_kind == 'ClusterServiceBroker' else broker_namespace }}"
+    service_broker_query: "{{
+      lookup(
+        'k8s',
+        api_version='servicecatalog.k8s.io/v1beta1',
+        kind=broker_kind,
+        resource_name=broker_name,
+        namespace=service_broker_query_namespace
+      )
+    }}"
+    service_broker_ready_status: "{{ service_broker_query | json_query(ready_status_query) }}"
+  tasks:
+    - name: Provision
+      when: tests_deploy_broker
+      block:
+        - name: Provision TSB
+          include_role:
+            name: template-service-broker
+          vars:
+            state: present
+
+        - name: Wait for broker to become ready
+          debug:
+            msg: "Broker ready status: {{ service_broker_ready_status }}"
+          retries: 60
+          delay: 10
+          until: service_broker_ready_status | length > 0 and service_broker_ready_status | first == "True"
+
+    - name: Create test namespace
+      k8s:
+        state: present
+        definition:
+          apiVersion: "{{ 'v1' if 'project.openshift.io' not in lookup('k8s', cluster_info='api_groups') else 'project.openshift.io/v1' }}"
+          kind: "{{ 'Namespace' if 'project.openshift.io' not in lookup('k8s', cluster_info='api_groups') else 'ProjectRequest' }}"
+          metadata:
+            name: "{{ test_namespace }}"
+
+    - name: Provision mediawiki
+      k8s:
+        state: present
+        definition:
+          apiVersion: servicecatalog.k8s.io/v1beta1
+          kind: ServiceInstance
+          metadata:
+            name: mediawiki
+            namespace: "{{ test_namespace }}"
+          spec:
+            clusterServiceClassExternalName: dh-mediawiki-apb
+            clusterServicePlanExternalName: default
+            parameters:
+              app_name: mediawiki
+              mediawiki_db_schema: "mediawiki"
+              mediawiki_site_name: "Mediawiki-CI"
+              mediawiki_site_lang: "en"
+              mediawiki_admin_user: "ci-user"
+              mediawiki_admin_pass: "admin"
+
+    - name: Wait for mediawiki service instance
+      debug:
+        msg: "Instance ready status: {{ mediawiki_query }}"
+      retries: 15
+      delay: 10
+      until: mediawiki_query | length > 0 and mediawiki_query | first == "True"
+
+    - name: Provision postgresql
+      k8s:
+        state: present
+        definition:
+          apiVersion: servicecatalog.k8s.io/v1beta1
+          kind: ServiceInstance
+          metadata:
+            name: postgresql
+            namespace: "{{ test_namespace }}"
+          spec:
+            clusterServiceClassExternalName: dh-postgresql-apb
+            clusterServicePlanExternalName: dev
+            parameters:
+              app_name: "postgresql"
+              postgresql_database: "admin"
+              postgresql_password: "admin"
+              postgresql_user: "admin"
+              postgresql_version: "9.6"
+
+    - name: Wait for postgresql service instance
+      debug:
+        msg: "Instance ready status: {{ postgresql_query }}"
+      retries: 15
+      delay: 10
+      until: postgresql_query | length > 0 and postgresql_query | first == "True"
+
+    - name: Create binding
+      k8s:
+        state: present
+        definition:
+          apiVersion: servicecatalog.k8s.io/v1beta1
+          kind: ServiceBinding
+          metadata:
+            name: mediawiki-postgresql-binding
+            namespace: "{{ test_namespace }}"
+          spec:
+            instanceRef:
+              name: postgresql
+          secretName: mediawiki-postgresql-binding
+
+    - name: Wait for mediawiki-postgresql binding instance
+      debug:
+        msg: "Binding ready status: {{ binding_query }}"
+      retries: 15
+      delay: 10
+      until: binding_query | length > 0 and binding_query | first == "True"
+
+    - name: Update mediawiki deployment(config)
+      k8s:
+        state: present
+        definition:
+          apiVersion: "{{ 'apps.openshift.io/v1' if 'apps.openshift.io' in lookup('k8s', cluster_info='api_groups') else 'apps/v1' }}"
+          kind: "{{ 'DeploymentConfig' if 'apps.openshift.io' in lookup('k8s', cluster_info='api_groups') else 'Deployment' }}"
+          metadata:
+            name: mediawiki
+            namespace: "{{ test_namespace }}"
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: mediawiki
+                    envFrom:
+                      - secretRef:
+                          name: mediawiki-postgresql-binding
+
+    - name: Wait for mediawiki deployment(config) to be updated
+      debug:
+        msg: "Waiting for mediawiki"
+      retries: 15
+      delay: 10
+      until: mediawiki_replicas == "1" and mediawiki_ready == "1" and mediawiki_updated == "1"
+
+    - name: Wait for mediawiki deployment(config) to be available
+      debug:
+        msg:
+          - "Deployment(config) ready status: {{ mediawiki_available }}"
+      retries: 15
+      delay: 10
+      until: mediawiki_available | length > 0 and mediawiki_available | first == "True"
+
+    - name: "Verify mediawiki"
+      uri:
+        url: "http://mediawiki.{{ test_namespace }}.svc.cluster.local:8080/index.php/Main_Page"
+        return_content: yes
+      retries: 15
+      delay: 10
+      register: webpage
+      until:
+        - webpage.status == 200
+        - "'MediaWiki has been installed.' in webpage.content"
+
+    - name: Delete binding
+      k8s:
+        state: absent
+        definition:
+          apiVersion: servicecatalog.k8s.io/v1beta1
+          kind: ServiceBinding
+          metadata:
+            name: mediawiki-postgresql-binding
+            namespace: "{{ test_namespace }}"
+
+    - name: Wait for mediawiki-postgresql binding instance to be removed
+      debug:
+        msg: "Binding ready status: {{ binding_query }}"
+      retries: 15
+      delay: 10
+      until: not binding_query
+
+    - name: Deprovision postgresql
+      k8s:
+        state: absent
+        definition:
+          apiVersion: servicecatalog.k8s.io/v1beta1
+          kind: ServiceInstance
+          metadata:
+            name: postgresql
+            namespace: "{{ test_namespace }}"
+
+    - name: Wait for postgresql service instance to be removed
+      debug:
+        msg: "Instance ready status: {{ postgresql_query }}"
+      retries: 15
+      delay: 10
+      until: not postgresql_query
+
+    - name: Deprovision mediawiki
+      k8s:
+        state: absent
+        definition:
+          apiVersion: servicecatalog.k8s.io/v1beta1
+          kind: ServiceInstance
+          metadata:
+            name: mediawiki
+            namespace: "{{ test_namespace }}"
+
+    - name: Wait for mediawiki service instance to be removed
+      debug:
+        msg: "Instance ready status: {{ mediawiki_query }}"
+      retries: 15
+      delay: 10
+      until: not mediawiki_query
+
+    - name: Delete test namespace
+      k8s:
+        state: absent
+        definition:
+          apiVersion: "{{ 'v1' if 'project.openshift.io' not in lookup('k8s', cluster_info='api_groups') else 'project.openshift.io/v1' }}"
+          kind: "{{ 'Namespace' if 'project.openshift.io' not in lookup('k8s', cluster_info='api_groups') else 'Project' }}"
+          metadata:
+            name: "{{ test_namespace }}"
+
+    - name: Wait for test namespace to be destroyed
+      vars:
+        namespace_lookup: "{{ lookup('k8s', kind='Namespace', resource_name=test_namespace) }}"
+      set_fact:
+        _namespace_status: "{{ namespace_lookup }}"
+      retries: 10
+      delay: 5
+      until:
+        - not namespace_lookup
+
+    - name: Deprovision test with CRDs
+      include_role:
+        name: automation-broker-apb
+      vars:
+        apb_action: deprovision
+        create_broker_namespace: true
+        broker_dao_type: crd
+      when: tests_deploy_broker
+
+    - name: Wait for namespace to be destroyed
+      vars:
+        namespace_lookup: "{{ lookup('k8s', kind='Namespace', resource_name='automation-broker') }}"
+      set_fact:
+        _namespace_status: "{{ namespace_lookup }}"
+      retries: 10
+      delay: 5
+      until:
+        - not namespace_lookup
+      when: tests_deploy_broker

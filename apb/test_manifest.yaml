@@ -1,0 +1,42 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: template-service-broker-apb
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: template-service-broker-apb
+  namespace: template-service-broker-apb
+
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: template-service-broker-apb
+roleRef:
+  name: cluster-admin
+  kind: ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: template-service-broker-apb
+  namespace: template-service-broker-apb
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: template-service-broker-apb
+  namespace: template-service-broker-apb
+spec:
+  serviceAccount: template-service-broker-apb
+  containers:
+    - name: apb
+      image: docker.io/automationbroker/template-service-broker-apb:latest
+      args: [ "test", "--extra-vars", '{ "create_broker_namespace": "true", "tests_deploy_broker": false }' ]
+      imagePullPolicy: IfNotPresent
+  restartPolicy: Never
+
