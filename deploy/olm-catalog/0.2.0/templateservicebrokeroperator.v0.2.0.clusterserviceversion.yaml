@@ -60,13 +60,13 @@ spec:
       url: https://github.com/openshift/origin/tree/master/pkg/templateservicebroker
   installModes:
   - type: OwnNamespace
-    supported: true
+    supported: false
   - type: SingleNamespace
     supported: true
   - type: MultiNamespace
     supported: false
   - type: AllNamespaces
-    supported: false
+    supported: true
   install:
     strategy: deployment
     spec:
